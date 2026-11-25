@@ -1,0 +1,44 @@
+{
+  "_help": "复制成 keys.json 再改。keys 里每一项一把钥匙：name 随便起，key 填你自己的钥匙，route 一般不动，maxConcurrent 是这个账号最多同时跑几个请求（0=不限），enabled 设 false 可临时停用。改完立即生效，不用重启。",
+  "port": 18787,
+  "routes": {
+    "opencode-go": "https://opencode.ai/inference/go"
+  },
+  "cooldown": {
+    "rateLimitMs": 30000,
+    "authErrorMs": 600000,
+    "upstreamMs": 8000,
+    "maxMs": 600000,
+    "jitter": 0.25
+  },
+  "maxAttempts": 0,
+  "queueTimeoutMs": 45000,
+  "totalTimeoutMs": 285000,
+  "sessionHeader": "x-opencode-session",
+  "keys": [
+    {
+      "name": "钥匙A",
+      "key": "把这里换成你的 opencode-go 钥匙",
+      "route": "opencode-go",
+      "maxConcurrent": 10,
+      "enabled": true
+    },
+    {
+      "name": "钥匙B",
+      "key": "第二把钥匙，用不上就删掉这一项",
+      "route": "opencode-go",
+      "maxConcurrent": 10,
+      "enabled": true
+    }
+  ],
+  "routing": {
+    "windowHours": { "rolling": 5, "weekly": 168, "monthly": 744 },
+    "targetShare": { "rolling": 1, "weekly": 0.8, "monthly": 0.6 },
+    "loadPoints": 0.3,
+    "failPoints": 1,
+    "tiePoints": 0.3,
+    "sticky": true,
+    "stickyTtlMs": 1800000,
+    "windowWeights": { "rolling": 0.2, "weekly": 0.5, "monthly": 1 }
+  }
+}
