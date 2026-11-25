@@ -1,4 +1,4 @@
-# opencode-go 钥匙池（本机中转）
+# keyshepherd · 多把 API 钥匙的本机中转
 
 > A local reverse proxy that pools multiple opencode-go API keys: it picks the key with the most
 > headroom left in its 5h / weekly / monthly quota windows, and rotates on 429 / 401 / 403 / 5xx
@@ -8,6 +8,9 @@
 > 撞到限流或失效自动换下一把，任务不中断。零依赖，只有 Node 标准库。
 
 服务地址 `http://127.0.0.1:18787` · 管理网页 `http://127.0.0.1:18787/`
+
+现在默认接的是 opencode-go，但代码里没有写死任何一家：`keys.json` 的 `routes` 是一张「名字 → 上游地址」表，
+每把钥匙各自挑一条（`route` 字段），换供应商就是加一行地址、给钥匙改个 `route`。
 
 作用：pi 的请求先到这里，中转按顺序挑一把钥匙发出去。撞到额度/并发上限（429）或钥匙失效（401/403）时，
 自动换下一把重发，任务不中断。钥匙数量不限，随时增删，改完立即生效。
