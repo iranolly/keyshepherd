@@ -1,13 +1,15 @@
 // opencode-go 多钥匙中转
 // 选钥匙：按额度松紧 + 当前负载 + 近期失败打分；同一段会话前缀优先粘住同一把（保缓存）
 // 换钥匙：429 / 401 / 403 / 5xx / 网络错误 / 2xx 里带 error；冷却退避加抖动，恢复期只放一条试探
+// 试探不能没完：拿到 2xx 就放开到满额，20 秒还没回声先放到 3 个位（probeMaxMs），剩下的交给断流检测
+// 只剩一把能接活的钥匙时不试探（单点故障再把并发压到 1，等于整池停摆）
 // 状态落盘到 state.json，重启不清零
 import http from "node:http";
 import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { handleUi } from "./ui.mjs";
 import * as usage from "./usage.mjs";
 import {
@@ -15,11 +17,15 @@ import {
   affinityKey,
   bodyLooksErrored,
   breakdownOf,
+  canTake,
+  capOf,
   classifyStatus,
   cooldownMs,
   fits,
   hasRoom,
   pickKey,
+  probeFor,
+  stableSessionId,
 } from "./routing.mjs";
 
 const DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -34,6 +40,19 @@ const HEADER_TIMEOUT_MS = 120_000;
 const IDLE_TIMEOUT_MS = 180_000;
 
 let cfgCache = { mtimeMs: 0, size: 0, cfg: null };
+// 失败只算最近一小时：一小时没再出错，惩罚从最短重来。
+// 以前这个数是永久累计的，一周前的一串 429 会一直压着这把钥匙的评分和并发。
+// 测试可以把窗口调小（KP_FAIL_WINDOW_MS），线上是 1 小时
+const FAIL_WINDOW_MS = Number(process.env.KP_FAIL_WINDOW_MS) || 3600e3;
+
+function getFails(s, now = Date.now()) {
+  const t = s.failTimes;
+  if (!Array.isArray(t)) return s.fails || 0;
+  while (t.length && now - t[0] > FAIL_WINDOW_MS) t.shift();
+  s.fails = t.length;
+  return s.fails;
+}
+
 const stats = new Map();
 const quotaCache = new Map(); // name -> { at, data, inflight }
 const sticky = new Map(); // fingerprint -> { name, at }
@@ -60,6 +79,14 @@ function state(name) {
       lastStatus: 0,
       active: 0,
       live: new Set(),
+      // 半开的代次：失败、进半开、清半开都会 +1；老定时器/老槽位对不上代次就什么也不做
+      failSeq: 0,
+      // 试探时真正放进去几个位：默认 1，20 秒还没回声放宽到 3
+      probeCap: 1,
+      // 这次冷却是多久设的（界面用它画倒计时）
+      coolTotalMs: 0,
+      // 失败的落点时间，超出窗口就丢掉
+      failTimes: [],
     };
     stats.set(name, s);
   }
@@ -74,7 +101,138 @@ function hold(s) {
 }
 
 function drop(s, tok) {
-  if (tok && s.live.delete(tok)) s.active = s.live.size;
+  if (!tok) return;
+  if (tok.probeTimer) {
+    clearTimeout(tok.probeTimer);
+    tok.probeTimer = null;
+  }
+  if (s.live.delete(tok)) s.active = s.live.size;
+  // 放宽过的试探位子要回落到 1：客户端中断 / 总时限 / 4xx 都不走 settle 也不走 strike，
+  // 不在这里收回来，下一次“只放一个”就变成“放三个”了
+  if (tok.probe && s.halfOpen && tok.seq === s.failSeq && (s.probeCap || 1) > 1) {
+    let otherProbe = false;
+    for (const t of s.live) {
+      if (t.probe && t.seq === s.failSeq) {
+        otherProbe = true;
+        break;
+      }
+    }
+    if (!otherProbe) s.probeCap = 1;
+  }
+}
+
+function bumpSeq(s) {
+  s.failSeq = (s.failSeq || 0) + 1;
+  return s.failSeq;
+}
+
+/** 进入半开：只放一个请求去试，并发上限重置回 1 */
+function enterProbe(s) {
+  s.halfOpen = true;
+  s.probeCap = 1;
+  bumpSeq(s);
+}
+
+function coolDown(s, ms) {
+  const until = Date.now() + ms;
+  if (until <= s.cooldownUntil) return;
+  s.cooldownUntil = until;
+  s.coolTotalMs = ms;
+}
+
+/** 记一次失败，并把半开的代次推一格（之前那个试探的结果不再作数） */
+function strike(s) {
+  if (!Array.isArray(s.failTimes)) s.failTimes = [];
+  getFails(s);
+  s.failTimes.push(Date.now());
+  s.fails = s.failTimes.length;
+  s.halfOpen = true;
+  s.probeCap = 1;
+  bumpSeq(s);
+}
+
+/** 试探通过：放开到正常并发。代次对不上（期间又失败过/槽位已释放）就什么也不做。 */
+function settleProbe(s, name, tok, why) {
+  if (!tok || !tok.probe || !s.halfOpen) return false;
+  if (tok.seq !== s.failSeq) return false;
+  // 槽位已经还回去了（客户端跑了 / 总时限到了），那个 2xx 不能当成“试探通过”的证据
+  if (!s.live.has(tok)) return false;
+  if (s.cooldownUntil > Date.now()) return false;
+  s.halfOpen = false;
+  s.fails = 0;
+  s.failTimes = [];
+  s.probeCap = 1;
+  bumpSeq(s);
+  if (tok.probeTimer) {
+    clearTimeout(tok.probeTimer);
+    tok.probeTimer = null;
+  }
+  log(`PROBE-OPEN key=${name} reason=${why} cap=${s.probeCap}`);
+  scheduleSave();
+  return true;
+}
+
+/** 试探迟迟没有回声：只把位子放宽到 cap，不清失败数（真失败得由失败路径来记） */
+function rampProbe(s, name, tok, cap) {
+  if (!tok || !tok.probe || !s.halfOpen) return;
+  if (tok.seq !== s.failSeq) return;
+  if (!s.live.has(tok)) return; // 这次试探已经结束，交给成功/失败去判
+  // 已经看过一个失败状态（比如刚回 500、正在等重试）就不要放宽了
+  if (tok.lastStatus && (tok.lastStatus < 200 || tok.lastStatus >= 300)) return;
+  if ((s.probeCap || 1) >= cap) return;
+  s.probeCap = cap;
+  log(`PROBE-RAMP key=${name} cap=${cap} 还没拿到响应头`);
+  scheduleSave();
+}
+
+/** 拿一个槽位。probe 的槽位带代次，并起一个“20 秒还没回声”的定时器 */
+function admit(cand, cfg, settle = true) {
+  const s = state(cand.name);
+  const probe = !!cand.probe && settle;
+  const tok = hold(s);
+  tok.probe = probe;
+  tok.seq = s.failSeq || 0;
+  if (probe) {
+    const ms = Number(cfg.probeMaxMs) || 0;
+    const cap = Math.max(1, Math.min(3, Number(cand.maxConcurrent) || 3));
+    if (ms > 0 && cap > 1) {
+      tok.probeTimer = setTimeout(() => rampProbe(s, cand.name, tok, cap), ms);
+      if (tok.probeTimer.unref) tok.probeTimer.unref();
+    }
+  }
+  return { key: cand, tok, probe };
+}
+
+/** 每把钥匙此刻为什么接不了活：给 503 的正文用 */
+function blockReport(cfg, tried) {
+  const now = Date.now();
+  return candidates(cfg, tried).map((c) => ({
+    name: c.name,
+    enabled: c.enabled,
+    coolingSeconds: Math.max(0, Math.ceil((state(c.name).cooldownUntil - now) / 1000)),
+    probe: !!c.probe,
+    active: c.active,
+    cap: c.cap,
+  }));
+}
+
+function busyText(list, waitedMs) {
+  const parts = list.map((k) => {
+    if (!k.enabled) return `${k.name} 已停用`;
+    if (k.coolingSeconds > 0) return `${k.name} 冷却中，还剩 ${fmtDur(k.coolingSeconds)}`;
+    if (k.probe) return `${k.name} 刚出过问题，只放 ${k.cap} 个（现在 ${k.active} 个在跑）`;
+    return `${k.name} 满员 ${k.active}/${k.cap || "不限"}`;
+  });
+  const waited = fmtDur(Math.round((Number(waitedMs) || 0) / 1000));
+  return `${parts.join("；")}。等了 ${waited}仍没有空位。`;
+}
+
+function fmtDur(sec) {
+  const s = Math.max(0, Math.round(Number(sec) || 0));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m} 分 ${r} 秒` : `${m} 分钟`;
 }
 
 function markOk(s) {
@@ -82,7 +240,13 @@ function markOk(s) {
   // 冷却中的钥匙被别的在途请求带成 2xx 时，不能清 fails/halfOpen，
   // 否则冷却一到期就按满并发打回去，探针语义也就没了
   if (s.cooldownUntil <= Date.now()) {
+    if (s.halfOpen || getFails(s) > 0) {
+      // 代次也要推一格：正在飞的试探槽位不能拿这个 2xx 当自己的结论
+      s.probeCap = 1;
+      bumpSeq(s);
+    }
     s.fails = 0;
+    s.failTimes = [];
     s.halfOpen = false;
   }
 }
@@ -156,6 +320,8 @@ function loadConfig() {
     queueOnCooldownMs: num(raw.queueOnCooldownMs, ROUTING_DEFAULTS.queueOnCooldownMs),
     retrySameKeyMs: num(raw.retrySameKeyMs, ROUTING_DEFAULTS.retrySameKeyMs),
     streamIdleTimeoutMs: num(raw.streamIdleTimeoutMs, 180000, 1000),
+    // 试探多久没回声就先放宽到 3 个位（0 = 不放宽，只等响应头或失败）
+    probeMaxMs: num(raw.probeMaxMs, 20000),
     // 单次请求的总时限：到点就断开并回 504，别让一把钥匙的槽位挂到天荒地老。
     // 默认 285 秒，比 pi 的 300 秒上限早一点，好让它先看到结果而不是被客户端掐。
     totalTimeoutMs: num(raw.totalTimeoutMs, 285000, 1000),
@@ -172,10 +338,13 @@ function loadConfig() {
   };
   const names = new Set(cfg.keys.map((k) => k.name));
   for (const n of [...stats.keys()]) {
-    if (!names.has(n)) {
-      stats.delete(n);
-      quotaCache.delete(n);
-    }
+    if (names.has(n)) continue;
+    // 还有在跑的请求就先把记录留着：删了再以同名加回来，新对象 active=0，
+    // 旧槽位那几条就白占了（同一把上游钥匙会被超发）
+    const st0 = stats.get(n);
+    if (st0 && st0.live && st0.live.size) continue;
+    stats.delete(n);
+    quotaCache.delete(n);
   }
   for (const [fp, e] of sticky) if (!names.has(e.name)) sticky.delete(fp);
 
@@ -198,7 +367,9 @@ function saveState() {
   for (const [name, s] of stats) {
     keys[name] = {
       cooldownUntil: s.cooldownUntil,
+      coolTotalMs: s.coolTotalMs || 0, // 界面画恢复进度要用
       fails: s.fails,
+      failTimes: s.failTimes || [],
       lastStatus: s.lastStatus,
       total: s.total,
       ok: s.ok,
@@ -221,6 +392,9 @@ function loadState() {
     for (const [name, s] of Object.entries(raw.keys || {})) {
       const t = state(name);
       Object.assign(t, s, { active: 0 });
+      // 老存档只有次数没有时间点：按“一分钟前刚失败过”补上，升级后不会突然全清
+      if (!Array.isArray(t.failTimes)) t.failTimes = Array.from({ length: t.fails || 0 }, () => Date.now() - 60000);
+      getFails(t);
       // 重启后冷却剩余时间超过上限说明时钟异常，忽略
       if (t.cooldownUntil - Date.now() > DEFAULTS_MAX_COOLDOWN) t.cooldownUntil = Date.now() + DEFAULTS_MAX_COOLDOWN;
     }
@@ -383,28 +557,40 @@ function bindingReset(name) {
   return Number.isFinite(t) ? t : 0;
 }
 
-function candidates(cfg) {
+function candidates(cfg, tried = new Set()) {
   const now = Date.now();
   // 只有一把可用钥匙时，把它冷却掉等于整池停摆；宁可继续用，让上游自己去限制
   const solo = cfg.keys.filter((k) => k.enabled !== false).length === 1;
-  return cfg.keys.map((k) => {
+  const list = cfg.keys.map((k) => {
     const s = state(k.name);
-    if (!s.halfOpen && s.fails > 0 && s.cooldownUntil <= now) s.halfOpen = true;
+    // 冷却结束、失败数还留着 → 进半开，先只放一个请求去试
+    if (!s.halfOpen && s.cooldownUntil <= now && getFails(s, now) > 0) enterProbe(s);
+    const maxConcurrent = Number(k.maxConcurrent) || 0;
     return {
       name: k.name,
       key: k.key,
       route: k.route,
       enabled: k.enabled !== false,
       ready: solo || s.cooldownUntil <= now,
-      probe: s.halfOpen && s.cooldownUntil <= now,
+      halfOpen: s.halfOpen && s.cooldownUntil <= now && getFails(s, now) > 0,
       active: s.active,
-      maxConcurrent: k.maxConcurrent,
+      maxConcurrent,
+      probeCap: Math.max(1, Number(s.probeCap) || 1),
       quota: quotaScore(k.name),
       resetAt: bindingReset(k.name),
       windows: quotaWindows(k.name),
-      fails: s.fails,
+      fails: getFails(s, now),
     };
   });
+  // “只剩一把能接活”按“其他钥匙既没在冷却、也没占满”算，而不是按“没在冷却”算：
+  // 别的钥匙都满员时这一把再自我降级，整池又得排队到超时（2026-11-26 的事故就是这样卡死的）。
+  // 传进去的是“能接活的钥匙个数”：1 = 就它自己 → 不降级；0 = 连它自己都接不了，降不降无所谓。
+  const others = list.filter((c) => !tried.has(c.name) && canTake(c));
+  for (const c of list) {
+    c.probe = probeFor(c, others.length);
+    c.cap = capOf(c);
+  }
+  return list;
 }
 
 function stickyGet(fp, cfg) {
@@ -437,8 +623,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function acquire(cfg, tried, ignoreCapacity = false) {
   const deadline = Date.now() + (ignoreCapacity ? 8000 : cfg.queueTimeoutMs);
   for (;;) {
-    const raw = candidates(cfg).filter((c) => !tried.has(c.name));
-    const cands = ignoreCapacity ? raw.map((c) => ({ ...c, active: 0, quota: null })) : raw;
+    const raw = candidates(cfg, tried).filter((c) => !tried.has(c.name));
+    // GET / HEAD 只做探活，不占位、也不替这扇门结测（/models 返回 200 不代表对话并发健康）
+    const cands = ignoreCapacity ? raw.map((c) => ({ ...c, active: 0, cap: 0, probe: false, quota: null })) : raw;
     if (!cands.length) return { none: true };
     const anyReady = cands.some((c) => c.enabled && c.ready);
     if (!anyReady) {
@@ -454,10 +641,7 @@ async function acquire(cfg, tried, ignoreCapacity = false) {
       return { coolingMs: wait };
     }
     const pick = pickKey(cands, cfg);
-    if (pick) {
-      const tok = hold(state(pick.name));
-      return { key: pick, tok };
-    }
+    if (pick) return admit(pick, cfg, !ignoreCapacity);
     // pickKey 只在“没有一把能接”时返回 null（全停用 / 全冷却 / 全满并发），
     // 额度打满不再整池拒绝，交给上游自己判（429 会进冷却）。
     if (Date.now() > deadline) return { busy: true };
@@ -504,6 +688,42 @@ function upstreamRequest({ targetUrl, headers, body, method = "POST", idleMs = I
     });
     req.end(method === "GET" || method === "HEAD" ? undefined : body);
   });
+}
+
+// 诊断用：设 KP_TRACE=<文件路径> 时，把每次请求里“会进缓存”的几块内容各算一个指纹，写一行。
+// 用来比对两次请求从哪一条开始不一样，定位“开头变了什么”。默认关闭，不写任何东西。
+const TRACE_PATH = process.env.KP_TRACE || "";
+function traceBody(route, model, bodyText, fp, headers) {
+  if (!TRACE_PATH || !bodyText) return;
+  let j;
+  try {
+    j = JSON.parse(bodyText);
+  } catch {
+    return;
+  }
+  const h = (v) =>
+    createHash("sha1").update(typeof v === "string" ? v : JSON.stringify(v ?? "")).digest("hex").slice(0, 12);
+  const raw = j.input ?? j.messages ?? null;
+  const items = Array.isArray(raw)
+    ? raw.map((m, i) => ({ i, role: m && m.role, len: JSON.stringify(m).length, h: h(m) }))
+    : [];
+  const line = {
+    ts: new Date().toISOString(),
+    route,
+    model,
+    fp,
+    sid: String(headers[process.env.KP_TRACE_SID_HEADER || "x-opencode-session"] || "").slice(0, 60),
+    bytes: bodyText.length,
+    keys: Object.keys(j).sort(),
+    instructions: h(j.instructions ?? ""),
+    tools: h(j.tools ?? null),
+    toolCount: Array.isArray(j.tools) ? j.tools.length : 0,
+    items,
+    itemCount: items.length,
+  };
+  try {
+    fs.appendFileSync(TRACE_PATH, JSON.stringify(line) + "\n");
+  } catch {}
 }
 
 function sendJson(res, code, obj) {
@@ -572,10 +792,15 @@ const server = http.createServer(async (req, res) => {
       breakdown: (name) => {
         const s = state(name);
         return breakdownOf(
-          { windows: quotaWindows(name), active: s.active, fails: s.fails, quota: quotaScore(name) },
+          { windows: quotaWindows(name), active: s.active, fails: getFails(s), quota: quotaScore(name) },
           loadConfig(),
           Date.now(),
         );
+      },
+      // 界面要知道“现在实际放几个位”：试跑时是 1，20 秒后可能是 3，其余时候是配置值
+      slotView: (name) => {
+        const c = candidates(loadConfig()).find((x) => x.name === name);
+        return c ? { probe: !!c.probe, cap: c.cap, halfOpen: !!c.halfOpen } : null;
       },
       renameExtra: (from, to) => {
         usage.renameKey(from, to);
@@ -595,7 +820,8 @@ const server = http.createServer(async (req, res) => {
       },
       removeExtra: (name) => {
         usage.removeKey(name);
-        stats.delete(name);
+        const st0 = stats.get(name);
+        if (!st0 || !st0.live || !st0.live.size) stats.delete(name);
         quotaCache.delete(name);
         for (const [fp, e] of sticky) if (e.name === name) sticky.delete(fp);
         scheduleSave();
@@ -639,6 +865,7 @@ const server = http.createServer(async (req, res) => {
     model = JSON.parse(bodyText).model || "";
   } catch {}
   const fp = affinityKey({ bodyText, sessionId: String(req.headers.session_id || ""), model });
+  traceBody(route, model, bodyText, fp, req.headers);
 
   const started = Date.now();
   // 总时限：从收到请求算起，包括排队、等响应头、流式传输
@@ -684,8 +911,8 @@ const server = http.createServer(async (req, res) => {
     if (stickyName && !tried.has(stickyName)) {
       const c = cands.find((x) => x.name === stickyName);
       if (c && c.enabled && c.ready && fits(c) && hasRoom(c, cfg)) {
-        const tok = hold(state(c.name));
-        key = { name: c.name, key: c.key, route: c.route, tok };
+        const slot = admit(c, cfg, fwdMethod === "POST");
+        key = { ...slot.key, tok: slot.tok };
       }
     }
 
@@ -710,8 +937,20 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       if (slot.busy) {
-        sendJson(res, 503, { error: "并发额度已满，等待超时" });
-        log(`FAIL busy route=${route}`);
+        // 报“并发满了”而不说谁在冷却、谁在试跑，就是把人往错的方向引。
+        // 这里逐把写清现场，界面和客户端都能直接看到原因。
+        const detail = blockReport(cfg, tried);
+        const waited = Date.now() - started;
+        sendJson(res, 503, {
+          error: busyText(detail, waited),
+          waitedSeconds: Math.round(waited / 1000),
+          keys: detail,
+        });
+        log(
+          `FAIL busy route=${route} waited=${Math.round(waited / 1000)}s ${detail
+            .map((d) => `${d.name}:${d.coolingSeconds > 0 ? `cool${d.coolingSeconds}s` : d.probe ? `probe${d.cap}` : "full"}${d.active}/${d.cap || "-"}`)
+            .join(" ")}`,
+        );
         return;
       }
       if (!slot.key || !slot.key.key) {
@@ -748,26 +987,37 @@ const server = http.createServer(async (req, res) => {
       headers.authorization = `Bearer ${key.key}`;
       if (fwdMethod === "POST") headers["content-length"] = String(body.length);
       else delete headers["content-length"];
-      if (cfg.sessionHeader && !headers[cfg.sessionHeader]) headers[cfg.sessionHeader] = randomUUID();
+      // 会话号必须稳定，否则上游每次都当新会话、缓存全丢（见 routing.mjs / stableSessionId）
+      if (cfg.sessionHeader && !headers[cfg.sessionHeader]) {
+        headers[cfg.sessionHeader] = stableSessionId({ headers, bodyText, fp }) || randomUUID();
+      }
 
       let upstream;
       try {
         upstream = await upstreamRequest({ targetUrl, headers, body, method: fwdMethod, idleMs: cfg.streamIdleTimeoutMs, deadlineAt });
         upstreamRes = upstream;
+        // 等响应头的这段时间里客户端可能已经跑了、总时限也可能到了，那这个 2xx 不作数；
+        // 上游这一头也不能晴着：不消费也不销毁，它会继续生成、继续计费
+        if (deadlineFired || res.destroyed) {
+          try {
+            upstream.destroy();
+          } catch {}
+          return;
+        }
       } catch (err) {
         if (deadlineFired) return;
         if (sameTry === 0) {
           log(`RETRY-SAME key=${key.name} kind=network wait=${cfg.retrySameKeyMs}ms`);
           await sleep(cfg.retrySameKeyMs);
+          if (deadlineFired) return;
           continue;
         }
         s.errors++;
-        s.fails++;
+        strike(s);
         releaseHeld();
         s.lastStatus = -1;
-        s.halfOpen = true;
-        const ms = cooldownMs("upstream", s.fails, 0, cfg);
-        s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + ms);
+        const ms = cooldownMs("upstream", getFails(s), 0, cfg);
+        coolDown(s, ms);
         stickyDrop(fp, key.name);
         usage.addFailure(key.name, "other");
         log(`ROTATE key=${key.name} kind=network tries=2 cooldown=${Math.round(ms / 1000)}s ${String(err && err.message).slice(0, 120)}`);
@@ -778,20 +1028,27 @@ const server = http.createServer(async (req, res) => {
       const status = upstream.statusCode || 0;
       const kind = classifyStatus(status);
       s.lastStatus = status;
+      if (tok) tok.lastStatus = status;
+
+      // 试探过了：拿到 2xx 就说明这把钥匙又能接活了。流式这里算最贴近的判据——
+      // 响应头已到、模型在出字，再等它跑完可能要几分钟，那就是事故里的卡死。
+      if (kind === "ok" && tok && tok.probe) {
+        const ct = String(upstream.headers["content-type"] || "");
+        if (ct.includes("event-stream")) settleProbe(s, key.name, tok, "stream-headers");
+      }
 
       if (kind === "rate" || kind === "auth") {
         upstream.resume();
         const retryAfter = Number.parseInt(String(upstream.headers["retry-after"] || ""), 10);
-        const ms = cooldownMs(kind, s.fails + 1, retryAfter, cfg);
-        s.fails++;
+        const ms = cooldownMs(kind, getFails(s) + 1, retryAfter, cfg);
+        strike(s);
         if (kind === "auth") s.authErrors++;
         else s.rateLimited++;
-        s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + ms);
+        coolDown(s, ms);
         releaseHeld();
-        s.halfOpen = true;
         stickyDrop(fp, key.name);
         usage.addFailure(key.name, kind === "auth" ? "auth" : "limited");
-        log(`ROTATE key=${key.name} status=${status} kind=${kind} fails=${s.fails} cooldown=${Math.round(ms / 1000)}s attempt=${attempt + 1}/${maxAttempts}`);
+        log(`ROTATE key=${key.name} status=${status} kind=${kind} fails=${getFails(s)} cooldown=${Math.round(ms / 1000)}s attempt=${attempt + 1}/${maxAttempts}`);
         scheduleSave();
         continue outer;
       }
@@ -804,22 +1061,23 @@ const server = http.createServer(async (req, res) => {
           continue;
         }
         const retryAfter = Number.parseInt(String(upstream.headers["retry-after"] || ""), 10);
-        const ms = cooldownMs("upstream", s.fails + 1, retryAfter, cfg);
-        s.fails++;
+        const ms = cooldownMs("upstream", getFails(s) + 1, retryAfter, cfg);
+        strike(s);
         s.errors++;
-        s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + ms);
+        coolDown(s, ms);
         releaseHeld();
-        s.halfOpen = true;
         stickyDrop(fp, key.name);
         usage.addFailure(key.name, "other");
-        log(`ROTATE key=${key.name} status=${status} kind=upstream fails=${s.fails} cooldown=${Math.round(ms / 1000)}s attempt=${attempt + 1}/${maxAttempts}`);
+        log(`ROTATE key=${key.name} status=${status} kind=upstream fails=${getFails(s)} cooldown=${Math.round(ms / 1000)}s attempt=${attempt + 1}/${maxAttempts}`);
         scheduleSave();
         continue outer;
       }
 
       if (kind === "fatal") {
         releaseHeld();
-        s.fails = Math.max(0, s.fails - 1);
+        // 客户端自己的错（坏参数、路径不对）不是钥匙的问题，但也不能拿来“洗白”半开：
+        // 以前这里减 fails，一串 400 就能把病钥匙放开到满并发。
+        s.clientErrors = (s.clientErrors || 0) + 1;
         const outHeaders = { ...upstream.headers };
         delete outHeaders["transfer-encoding"];
         res.writeHead(status, outHeaders);
@@ -865,14 +1123,15 @@ const server = http.createServer(async (req, res) => {
 
         if (broken) {
           releaseHeld();
+          // 总时限到点是我们自己提断的，不是上游的错；已经不记失败了，这里也不能再记
+          if (deadlineFired) return;
           // 包太大是客户端的问题，不怪钥匙；中途断流是上游的故障，要换下一把，
           // 否则这把"假健康"的钥匙会被反复选中
           if (!overCap) {
-            s.fails++;
+            strike(s);
             s.errors++;
-            s.halfOpen = true;
-            const ms = cooldownMs("upstream", s.fails, 0, cfg);
-            s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + ms);
+            const ms = cooldownMs("upstream", getFails(s), 0, cfg);
+            coolDown(s, ms);
             stickyDrop(fp, key.name);
             usage.addFailure(key.name, "other");
             log(`ROTATE key=${key.name} kind=body-timeout bytes=${buf.length} cooldown=${Math.round(ms / 1000)}s attempt=${attempt + 1}/${maxAttempts}`);
@@ -888,18 +1147,18 @@ const server = http.createServer(async (req, res) => {
         const text = buf.toString("utf8");
         if (bodyLooksErrored(text)) {
           releaseHeld();
-          s.fails++;
+          strike(s);
           s.errors++;
-          s.halfOpen = true;
-          const ms = cooldownMs("upstream", s.fails, 0, cfg);
-          s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + ms);
+          const ms = cooldownMs("upstream", getFails(s), 0, cfg);
+          coolDown(s, ms);
           stickyDrop(fp, key.name);
           usage.addFailure(key.name, "other");
-          log(`ROTATE key=${key.name} kind=body-error fails=${s.fails} cooldown=${Math.round(ms / 1000)}s`);
+          log(`ROTATE key=${key.name} kind=body-error fails=${getFails(s)} cooldown=${Math.round(ms / 1000)}s`);
           scheduleSave();
           continue outer;
         }
 
+        settleProbe(s, key.name, tok, "body-ok");
         markOk(s);
         releaseHeld();
         stickySet(fp, key.name, cfg);
@@ -954,11 +1213,12 @@ const server = http.createServer(async (req, res) => {
       upstream.on("error", () => {
         release();
         if (clientGone || completed) return;
+        // 总时限到点是我们自己提断的，不记成钥匙的错（以前长对话一到 285 秒就把钥匙打冷却）
+        if (deadlineFired) return;
         s.errors++;
-        s.fails++;
-        s.halfOpen = true;
-        const ms = cooldownMs("upstream", s.fails, 0, cfg);
-        s.cooldownUntil = Math.max(s.cooldownUntil, Date.now() + ms);
+        strike(s);
+        const ms = cooldownMs("upstream", getFails(s), 0, cfg);
+        coolDown(s, ms);
         stickyDrop(fp, key.name);
         log(`STREAM-BREAK key=${key.name} after=${collected}B cooldown=${Math.round(ms / 1000)}s`);
         res.destroy();
@@ -1000,12 +1260,15 @@ const server = http.createServer(async (req, res) => {
 
 function health(cfg) {
   const now = Date.now();
+  // 和挑钥匙用同一份候选：界面看到的“能不能接、几个位”必须和真的调度一致
+  const views = new Map(candidates(cfg).map((c) => [c.name, c]));
   return {
     ok: true,
     port: cfg.port,
     keys: cfg.keys.map((k) => {
       const s = state(k.name);
-      const bd = breakdownOf({ windows: quotaWindows(k.name), active: s.active, fails: s.fails }, cfg, now);
+      const view = views.get(k.name) || {};
+      const bd = breakdownOf({ windows: quotaWindows(k.name), active: s.active, fails: getFails(s) }, cfg, now);
       return {
         name: k.name,
         route: k.route,
@@ -1013,8 +1276,10 @@ function health(cfg) {
         masked: mask(k.key),
         ready: s.cooldownUntil <= now,
         cooldownSeconds: Math.max(0, Math.ceil((s.cooldownUntil - now) / 1000)),
-        probe: s.fails > 0,
-        fails: s.fails,
+        cooldownTotalSeconds: Math.max(0, Math.ceil((s.coolTotalMs || 0) / 1000)),
+        probe: !!view.probe,
+        cap: view.cap == null ? (k.maxConcurrent || 0) : view.cap,
+        fails: getFails(s),
         quota: quotaScore(k.name),
         resetsAt: bindingReset(k.name) ? new Date(bindingReset(k.name)).toISOString() : null,
         score: Math.round(bd.total * 10) / 10,

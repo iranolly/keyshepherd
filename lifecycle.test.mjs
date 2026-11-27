@@ -230,11 +230,25 @@ try {
   check("带 server-timing 的请求也返回 200", tm.status === 200, `status=${tm.status}`);
 
   // 6. 上游答应却永远不结束：总时限到点要收尾，不能把槽位吊死
+  const beforeTimed = await health(base);
+  const beforeFails = Object.fromEntries(beforeTimed.keys.map((k) => [k.name, k.fails]));
   const td = await post(base, "/opencode-go/t/timed", JSON.stringify({ model: "m", input: "hi", stream: true }));
   check("总时限到点能收尾", td.status === 504 || (td.status === 0 && td.ms < 14000), `status=${td.status} ms=${td.ms} err=${td.error || ""}`);
   await sleep(400);
   check("总时限后槽位归零", (await activeSum(base)) === 0);
   check("日志记下 TIMEOUT", /TIMEOUT .*after=\d+s/.test(readLog()));
+
+  // 总时限是我们自己提断的：不能把接这个请求的钥匙记成故障
+  // （以前就是这样把钥匙打进半开，接着整池卡住）
+  const afterTimeout = await health(base);
+  const timedLines = readLog().split("\n").filter((l) => l.includes("TIMEOUT") && l.includes("key="));
+  const timedKey = (timedLines.pop() || "").split("key=").pop().split(" ")[0];
+  const afterKey = afterTimeout.keys.find((k) => k.name === timedKey) || {};
+  check(
+    "总时限不记成钥匙失败",
+    !!afterKey.name && afterKey.fails === beforeFails[timedKey] && afterKey.cooldownSeconds === 0,
+    `key=${timedKey || "?"} fails ${beforeFails[timedKey]}→${afterKey.fails} cool=${afterKey.cooldownSeconds}`,
+  );
 
   // 7. 客户端先跑（pi 的 300 秒上限）：以前这里一片空白，现在要留痕
   const ac = new AbortController();

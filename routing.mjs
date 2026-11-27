@@ -12,6 +12,10 @@
 //
 // 为什么不用「预计停机小时」：那要拿一天的样本外推一个月，误差能翻十倍；还要在三档之间比较
 // 5 小时和 720 小时两个量纲。B 只用"你烧得比时间快还是慢"，不外推、不用阈值、三档天然可比。
+//
+// 例外（2026-11-27）：5h 档闲着的时候平台根本不走这条额度，按时间算出来的预期线永远是 0%，
+// 于是这把钥匙既不报限流、也不显得落后。所以 5h 实际用量只要还是 0%，预期线一律钉成 100%
+// 见 windowProgress 里的 zeroRollingIsBehind。
 import crypto from "node:crypto";
 
 export const WINDOW_NAMES = ["rolling", "weekly", "monthly"];
@@ -91,8 +95,11 @@ export function cooldownMs(kind, fails, retryAfterSec, cfg, rnd = Math.random) {
 
 /* ---------------- 额度窗口 ---------------- */
 
-/** 单档进度：已用百分比、本轮长度、已过时长、按预期到目前该用多少 */
-export function windowProgress(win, now, fallbackHours, targetShare = 1) {
+/**
+ * 单档进度：已用百分比、本轮长度、已过时长、按预期到目前该用多少
+ * name 是本档名字（rolling / weekly / monthly），只有 5h 档需要它，见 zeroRollingIsBehind。
+ */
+export function windowProgress(win, now, fallbackHours, targetShare = 1, name = "") {
   if (!win || typeof win !== "object") return null;
   const rawPercent = Number(String(win.percent ?? "").replace("%", "").trim());
   if (!Number.isFinite(rawPercent)) return null;
@@ -104,6 +111,10 @@ export function windowProgress(win, now, fallbackHours, targetShare = 1) {
   if (!Number.isFinite(fullHours) || fullHours <= 0) fullHours = null;
 
   const beta = Number(targetShare) > 0 && Number(targetShare) <= 1 ? Number(targetShare) : 1;
+  // 5h 档一点没用过就当成"时间早该用完了"：平台在你闲着的时候不推进这档额度，
+  // 按时间算的预期线会一直停在 0%，这把钥匙看着像半点没动，既不会被判超前也不抢活。
+  // 钉成 100% 之后，实际 0% 的钥匙算严重落后 → 优先派活（额度不用就白扔），界面也显示预期 100%。
+  const zeroRollingIsBehind = name === "rolling" && percent === 0;
   const resetAtMs = Number(win.resetAtMs) || (win.resetsAt ? Date.parse(win.resetsAt) : NaN);
   // 一份快照过期了（重置点已经过去超过一分钟）：这一档的数字不可信，不参与打分。
   // 否则“预期早已过线 + 已用 0%”会把它算成极度落后，反而抢走所有流量。
@@ -116,10 +127,10 @@ export function windowProgress(win, now, fallbackHours, targetShare = 1) {
 
   if (!fullHours) {
     // 没有窗口长度也算一份数据：余量还能用，只是没法定预期线
-    return { percent, elapsedHours: null, fullHours: null, targetHours: null, targetShare: beta, proRata: null, resetAtMs: Number.isFinite(resetAtMs) ? resetAtMs : 0 };
+    return { percent, elapsedHours: null, fullHours: null, targetHours: null, targetShare: beta, proRata: zeroRollingIsBehind ? 100 : null, resetAtMs: Number.isFinite(resetAtMs) ? resetAtMs : 0 };
   }
   if (!Number.isFinite(elapsedHours)) {
-    return { percent, elapsedHours: null, fullHours, targetHours: fullHours * beta, targetShare: beta, proRata: null, resetAtMs: Number.isFinite(resetAtMs) ? resetAtMs : 0 };
+    return { percent, elapsedHours: null, fullHours, targetHours: fullHours * beta, targetShare: beta, proRata: zeroRollingIsBehind ? 100 : null, resetAtMs: Number.isFinite(resetAtMs) ? resetAtMs : 0 };
   }
   const e = Math.min(Math.max(elapsedHours, 0), fullHours);
   const targetHours = fullHours * beta; // 预期在这一刻把本档用到 100%
@@ -129,8 +140,8 @@ export function windowProgress(win, now, fallbackHours, targetShare = 1) {
     fullHours,
     targetHours,
     targetShare: beta,
-    // 预期线：到 targetHours 时刚好 100%，之后封顶 100%（“按预期你早该用完了”）
-    proRata: Math.min(100, (100 * e) / targetHours),
+    // 预期线：到 targetHours 时刚好 100%，之后封顶 100%（"按预期你早该用完了"）
+    proRata: zeroRollingIsBehind ? 100 : Math.min(100, (100 * e) / targetHours),
     resetAtMs: Number.isFinite(resetAtMs) && resetAtMs > 0 ? resetAtMs : 0,
   };
 }
@@ -153,7 +164,7 @@ export function breakdownOf(cand, cfg, now = Date.now()) {
   let hasData = false;
   for (const name of WINDOW_NAMES) {
     const share = Number.isFinite(Number(shares[name])) ? Number(shares[name]) : WINDOW_SHARE[name];
-    const w = windowProgress(wins[name], now, periods[name], targets[name]);
+    const w = windowProgress(wins[name], now, periods[name], targets[name], name);
     if (!w) {
       rows.push({ name, share, missing: true });
       continue;
@@ -211,8 +222,47 @@ export function hasRoom(cand, cfg, now = Date.now()) {
   return b.R == null ? true : b.R > 0;
 }
 
+/**
+ * 实际可用并发。cand.cap 由调用方算好（试跑时可能是 1，也可能是放宽后的 3）：
+ * 单看 probe 布尔会丢掉“试跑放宽到几个位”这个信息。0 仍然表示不限。
+ */
+export function effectiveCap(cand) {
+  if (!cand) return 0;
+  if (cand.cap !== undefined && cand.cap !== null && Number.isFinite(Number(cand.cap))) {
+    return Math.max(0, Number(cand.cap));
+  }
+  const fallback = cand.probe ? capOf(cand) : Number(cand.maxConcurrent) || 0;
+  return Math.max(0, fallback);
+}
+
+/** 不考虑试探降级时，这把钥匙还能不能接活 */
+export function canTake(cand) {
+  if (!cand || cand.enabled === false) return false;
+  if (cand.ready === false) return false;
+  const cap = Number(cand.maxConcurrent) || 0;
+  return !cap || (Number(cand.active) || 0) < cap;
+}
+
+/**
+ * 半开的钥匙要不要降级成“只放一个”。
+ * othersCanTake = 除它以外还能接活的钥匙个数；只剩它自己的时候不降级——
+ * 单点故障时再把并发压到 1，整池就得排队到超时（2026-11-26 的事故就是这样卡死的）。
+ */
+export function probeFor(cand, othersCanTake) {
+  return !!(cand && cand.halfOpen && Number(cand.fails) > 0 && Number(othersCanTake) > 1);
+}
+
+/** 试探时真正放几个位：默认 1，迟迟没回声可以放宽（probeCap），不超过配置值 */
+export function capOf(cand) {
+  if (!cand) return 0;
+  const max = Number(cand.maxConcurrent) || 0;
+  if (!cand.probe) return max;
+  const ramp = Math.max(1, Number(cand.probeCap) || 1);
+  return max ? Math.min(ramp, max) : ramp;
+}
+
 export function fits(cand) {
-  const cap = cand.probe ? 1 : cand.maxConcurrent || 0;
+  const cap = effectiveCap(cand);
   return !cap || (cand.active || 0) < cap;
 }
 
@@ -262,6 +312,28 @@ export function pickKey(cands, cfg, now = Date.now()) {
 }
 
 // 会话粘住：同一段前缀尽量用同一把钥匙，保住供应商侧的缓存
+//
+// 会话号：客户端没带时不能随手编一个新的——上游按会话号划分缓存与路由，
+// 每次换号等于每次都开新会话。2026-11-26 实测（deepseek-v4.1-flash / opencode-go）：
+//   同一段内容连发三次，会话号固定 → 第 2、3 次命中 96%～100%；每次换号 → 全 0。
+// 优先级：客户端自己带的 session_id / x-client-request-id → 请求体 prompt_cache_key
+//        → 会话指纹 fp（同一段前缀的哈希，同一段对话里不变）。
+export function stableSessionId({ headers = {}, bodyText = "", fp = null } = {}) {
+  const pick = (v) => (typeof v === "string" && v.trim() ? v.trim() : "");
+  const direct =
+    pick(headers.session_id) || pick(headers["x-client-request-id"]) || pick(headers["x-request-id"]);
+  if (direct) return direct;
+  if (bodyText) {
+    try {
+      const j = JSON.parse(bodyText);
+      const ck = pick(j.prompt_cache_key);
+      if (ck) return ck;
+    } catch {
+      /* 不是 JSON 就不猜 */
+    }
+  }
+  return fp ? `kp-${fp}` : null;
+}
 export function affinityKey({ bodyText, sessionId, model }) {
   const h = crypto.createHash("sha1");
   if (bodyText) {

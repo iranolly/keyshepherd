@@ -1,7 +1,19 @@
 // 用量统计：按钥匙、按天记账，落盘到 usage.json
 import fs from "node:fs";
 
-const empty = () => ({ input: 0, output: 0, cost: 0, requests: 0, limited: 0, auth: 0, other: 0 });
+// cacheVer=2 才代表“缓存那两栏是真的”：之前那版读不懂上游字段，落的是 0，
+// 留着会把命中率摊薄成人造的低值，启动时一并清掉。
+const CACHE_VER = 2;
+const empty = () => ({ input: 0, output: 0, cost: 0, requests: 0, limited: 0, auth: 0, other: 0, cacheRead: 0, promptTotal: 0, cacheVer: CACHE_VER });
+
+function migrateCache(e) {
+  if (!e || typeof e !== "object") return;
+  if (e.cacheVer !== CACHE_VER) {
+    e.cacheRead = 0;
+    e.promptTotal = 0;
+    e.cacheVer = CACHE_VER;
+  }
+}
 const today = () => new Date().toLocaleDateString("sv-SE"); // 本机时区的 YYYY-MM-DD
 
 let file = null;
@@ -13,6 +25,12 @@ export function init(path, validNames) {
   try {
     const raw = JSON.parse(fs.readFileSync(path, "utf8"));
     if (raw && typeof raw === "object") {
+      migrateCache(raw.totals);
+      for (const e of Object.values(raw.daily || {})) migrateCache(e);
+      for (const e of Object.values(raw.keys || {})) {
+        migrateCache(e.total);
+        migrateCache(e.today);
+      }
       data = {
         totals: { ...empty(), ...(raw.totals || {}) },
         daily: raw.daily || {},
@@ -34,6 +52,7 @@ export function init(path, validNames) {
     k.day = k.day || today();
     k.today = { ...empty(), ...(k.today || {}) };
   }
+
 }
 
 function scheduleSave() {
@@ -98,9 +117,14 @@ export function addFailure(name, kind) {
   scheduleSave();
 }
 
-export function addUsage(name, { input, output, cost }) {
-  if (!input && !output && !cost) return;
+export function addUsage(name, { input, output, cost, cacheRead, promptTotal, hasCache }) {
+  if (!input && !output && !cost && !cacheRead) return;
   const delta = { input: input || 0, output: output || 0, cost: cost || 0 };
+  // 上游没给缓存字段就不进分母：宁可这几天不显示，也不显示一个被摊薄的低值
+  if (hasCache) {
+    delta.cacheRead = cacheRead || 0;
+    delta.promptTotal = promptTotal || 0;
+  }
   const e = entry(name);
   bump(e.total, delta);
   bump(e.today, delta);
@@ -147,6 +171,10 @@ export function extractUsage(text) {
   let input = 0;
   let output = 0;
   let cost = 0;
+  let cacheRead = 0;
+  let promptTotal = 0;
+  // 只有上游真的给了缓存字段，这一次才算“可测量”：混进没给的请求会把命中率摊薄成人造的低值
+  let hasCache = false;
   const re = /"usage"\s*:\s*\{/g;
   let m;
   while ((m = re.exec(text))) {
@@ -161,6 +189,32 @@ export function extractUsage(text) {
     }
     if (!u || typeof u !== "object") continue;
     const inTok = num(u.prompt_tokens ?? u.input_tokens);
+    // 缓存命中：anthropic 单独给 cache_read_input_tokens（input 不含它），
+    // openai 兼容的塞在 prompt_tokens_details.cached_tokens（prompt_tokens 含它）
+    const cachedA = num(u.cache_read_input_tokens);
+    // 各家叫法：anthropic 的 cache_read_input_tokens、openai 的 prompt_tokens_details.cached_tokens、
+    // deepseek 的 prompt_cache_hit_tokens、少数直接给 cached_tokens
+    // responses 接口（pi 的默认后端）塞在 input_tokens_details.cached_tokens 里，
+    // 网关自己还有一份 opencode.tokens.cache_read 兜底
+    const cachedO =
+      num(u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) ||
+      num(u.input_tokens_details && u.input_tokens_details.cached_tokens) ||
+      num(u.prompt_cache_hit_tokens) ||
+      num(u.cached_tokens) ||
+      num(u.opencode && u.opencode.tokens && u.opencode.tokens.cache_read);
+    const hasField =
+      typeof u.cache_read_input_tokens === "number" ||
+      typeof u.prompt_cache_hit_tokens === "number" ||
+      typeof u.cached_tokens === "number" ||
+      typeof (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) === "number" ||
+      typeof (u.input_tokens_details && u.input_tokens_details.cached_tokens) === "number";
+    const pTotal = cachedA ? inTok + cachedA : hasField ? Math.max(inTok, cachedO) : inTok;
+    const cRead = cachedA || cachedO;
+    if (pTotal > promptTotal) {
+      promptTotal = pTotal;
+      cacheRead = cRead;
+      hasCache = hasField;
+    }
     const outTok = num(u.completion_tokens ?? u.output_tokens);
     const c = num(u.cost) || num(u.list_cost) || num(u.opencode && u.opencode.list_cost);
     if (inTok > input) input = inTok;
@@ -173,7 +227,7 @@ export function extractUsage(text) {
     let o;
     while ((o = out.exec(text))) output = Math.max(output, Number(o[1]));
   }
-  return { input, output, cost };
+  return { input, output, cost, cacheRead, promptTotal, hasCache };
 }
 
 function num(v) {

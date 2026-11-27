@@ -13,7 +13,13 @@ import {
   hasRoom,
   pickKey,
   scoreOf,
+  stableSessionId,
   windowProgress,
+  canTake,
+  capOf,
+  effectiveCap,
+  fits,
+  probeFor,
 } from "./routing.mjs";
 
 const cfg = { cooldown: { ...DEFAULTS.cooldown }, routing: { ...DEFAULTS.routing } };
@@ -81,11 +87,24 @@ assert.ok(badLen.proRata < 5, `应=${badLen.proRata}`);
 // 5 小时档不压缩
 assert.ok(near(windowProgress(win(5, 2.5, 50), now, 5, 1).proRata, 50, 0.5));
 
+// 5h 实际 0%：闲着的时候平台不推进这档额度，所以不管本轮走了多久，预期线一律 100%
+assert.equal(windowProgress(win(5, 0.1, 0), now, 5, 1, "rolling").proRata, 100);
+assert.equal(windowProgress(win(5, 3.5, 0), now, 5, 1, "rolling").proRata, 100);
+// 只有 5h 档这样：周档 0% 还是按时间算（2.8 天过了 5.6 天的一半 → 50%）
+assert.ok(near(windowProgress(win(168, 67.2, 0), now, 168, 0.8, "weekly").proRata, 50, 0.5));
+// 于是实际 0% 的钥匙被判成落后 100 个点：B 少了 0.2 × 100 = 20，优先派活
+const idle5 = mk({ name: "idle5", windows: { rolling: win(5, 0.1, 0) } });
+const idleBreak = breakdownOf(idle5, cfg, now);
+assert.equal(idleBreak.windows.find((w) => w.name === "rolling").proRata, 100);
+assert.ok(near(idleBreak.B, -20, 0.01), `B=${idleBreak.B}`);
+
 // 落后于时间线的更优先（额度要白扔的那个先烧）
 const behind = mk({ name: "behind", windows: { rolling: win(5, 3.5, 10) } });
 const ahead = mk({ name: "ahead", windows: { rolling: win(5, 3.5, 70) } });
 assert.ok(scoreOf(behind, cfg, now) < scoreOf(ahead, cfg, now));
 assert.equal(pickKey([ahead, behind], cfg, now).name, "behind");
+// 5h 实际 0% 的钥匙排在最前面：一点没用过，额度不用就白扔
+assert.equal(pickKey([ahead, behind, idle5], cfg, now).name, "idle5");
 
 // 5 小时档刚开窗、只过了几分钟也不会炸：按真实比例算，没有覆盖率悬崖
 const fresh = breakdownOf({ windows: { monthly: win(720, 0.2, 0.5) } }, cfg, now);
@@ -133,6 +152,36 @@ assert.equal(pickKey([sick, behind], cfg, now).name, "behind");
 
 // 冷却后试探只放一个
 assert.equal(pickKey([mk({ name: "p", probe: true, active: 1, windows: { rolling: win(5, 3.5, 10) } })], cfg, now), null);
+
+/* ---------- 试探：放几个位、什么时候不放 ---------- */
+
+// 位子数：默认 1，放宽也不超过配置值；0 仍然是不限
+assert.equal(capOf({ probe: true, maxConcurrent: 10, probeCap: 1 }), 1);
+assert.equal(capOf({ probe: true, maxConcurrent: 10, probeCap: 3 }), 3);
+assert.equal(capOf({ probe: true, maxConcurrent: 2, probeCap: 3 }), 2, "放宽不能超过配置值");
+assert.equal(capOf({ probe: false, maxConcurrent: 10 }), 10);
+assert.equal(capOf({ probe: true, maxConcurrent: 0, probeCap: 3 }), 3);
+assert.equal(effectiveCap({ cap: 3, probe: true, maxConcurrent: 10 }), 3, "算好的 cap 优先");
+assert.equal(effectiveCap({ probe: true, maxConcurrent: 10, probeCap: 3 }), 3);
+assert.equal(effectiveCap({ probe: true, maxConcurrent: 10 }), 1);
+assert.equal(effectiveCap({ cap: 0, probe: false, maxConcurrent: 10 }), 0, "0 = 不限");
+assert.equal(fits({ probe: true, maxConcurrent: 10, active: 1 }), false);
+assert.equal(fits({ probe: false, maxConcurrent: 10, active: 1 }), true);
+assert.equal(fits({ probe: true, maxConcurrent: 10, probeCap: 3, active: 2 }), true);
+
+// 只剩自己一把能接活时不试探（单点故障不能再把并发压到 1）
+assert.equal(probeFor({ halfOpen: true, fails: 1 }, 2), true);
+assert.equal(probeFor({ halfOpen: true, fails: 1 }, 1), false);
+assert.equal(probeFor({ halfOpen: true, fails: 1 }, 0), false, "别的钥匙都接不了更不该自我降级");
+assert.equal(probeFor({ halfOpen: false, fails: 0 }, 2), false);
+assert.equal(probeFor({ halfOpen: true, fails: 0 }, 2), false, "失败数归零就不再半开");
+
+// “还能接活”的判据：冷却中 / 占满 / 停用 都不算
+assert.equal(canTake({ enabled: true, ready: true, maxConcurrent: 4, active: 3 }), true);
+assert.equal(canTake({ enabled: true, ready: true, maxConcurrent: 4, active: 4 }), false);
+assert.equal(canTake({ enabled: true, ready: false, maxConcurrent: 4, active: 0 }), false);
+assert.equal(canTake({ enabled: false, ready: true, maxConcurrent: 4, active: 0 }), false);
+assert.equal(canTake({ enabled: true, ready: true, maxConcurrent: 0, active: 99 }), true, "0 = 不限");
 
 /* ---------- 并列 ---------- */
 
@@ -186,6 +235,23 @@ const one = body("", "第一段");
 const two = JSON.stringify({ model: "m", input: [{ role: "user", content: "第一段" }, { role: "assistant", content: "y" }] });
 assert.equal(affinityKey({ bodyText: one }), affinityKey({ bodyText: two }));
 assert.notEqual(affinityKey({ bodyText: one }), affinityKey({ bodyText: body("", "别的") }));
+
+// 会话号：客户端带了就用客户端的；没带就用同一段对话里稳定的指纹，不能每次变
+assert.equal(stableSessionId({ headers: { session_id: "s-1" }, fp: "p:aa" }), "s-1");
+assert.equal(stableSessionId({ headers: { "x-client-request-id": "r-1" } }), "r-1");
+assert.equal(stableSessionId({ headers: {}, bodyText: body("ck-1", "x") }), "ck-1");
+const fpOne = affinityKey({ bodyText: one });
+assert.equal(stableSessionId({ headers: {}, bodyText: one, fp: fpOne }), `kp-${fpOne}`);
+assert.equal(
+  stableSessionId({ headers: {}, bodyText: one, fp: fpOne }),
+  stableSessionId({ headers: {}, bodyText: two, fp: fpOne }),
+  "同一段对话前缀 → 同一个会话号",
+);
+assert.notEqual(
+  stableSessionId({ headers: {}, bodyText: one, fp: fpOne }),
+  stableSessionId({ headers: {}, bodyText: body("", "别的"), fp: affinityKey({ bodyText: body("", "别的") }) }),
+);
+assert.equal(stableSessionId({ headers: {} }), null, "什么都没有时返回 null，由调用方兜底");
 
 // 200 里包错误
 assert.equal(bodyLooksErrored('{"error":{"message":"x"}}'), true);
