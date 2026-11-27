@@ -17,3 +17,8 @@ modelsync.log
 *.jpg
 *.html
 dsh-task.json
+
+# 本地工具目录与抓包产物
+.pi/
+.serena/
+trace.jsonl
