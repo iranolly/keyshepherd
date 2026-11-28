@@ -36,6 +36,7 @@ const PAGE = String.raw`<!doctype html>
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
     font:14px/1.45 -apple-system,"Segoe UI","Microsoft YaHei",system-ui,sans-serif;
+    font-variant-numeric:tabular-nums;
     display:flex;justify-content:center;padding:46px 20px}
   /* 用 zoom 放大整页：宽度的上限也按同一比例折算，视觉上不会溢出窗口 */
   .wrap{width:100%;max-width:calc(880px / var(--ui-scale));zoom:var(--ui-scale)}
@@ -70,6 +71,10 @@ const PAGE = String.raw`<!doctype html>
   .dot.full{background:var(--bad);box-shadow:none}
   .dot.probe{background:transparent;box-shadow:inset 0 0 0 1.5px var(--warm)}
   .dot.off{background:transparent;box-shadow:inset 0 0 0 1.5px var(--dim)}
+  /* 拿不到额度数据：空心灰点。不知道就是不知道，不冒充绿灯 */
+  .dot.unknown{background:transparent;box-shadow:inset 0 0 0 1.5px var(--dim)}
+  .row.stale .bars3{opacity:.4}
+  .row.stale .score{color:var(--dim)}
 
   .score{font:13.5px ui-monospace,Consolas,monospace;letter-spacing:-.02em;cursor:help;color:var(--muted)}
   .score.low{color:var(--ok)} .score.mid{color:var(--warm)} .score.high{color:var(--bad)}
@@ -82,7 +87,9 @@ const PAGE = String.raw`<!doctype html>
      文字位置一点不动，描边却有地方画了 */
   .line{display:flex;align-items:baseline;gap:8px;min-width:0;overflow:hidden;padding:4px;margin:-4px}
   .row .line{overflow:hidden}
-  .name{font-weight:560;font-size:13.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:text}
+  /* 名字里常带编号：数字用等宽，和右边的并发 / 用量对齐成一条竖线 */
+  .name{font-weight:560;font-size:13.5px;font-family:ui-monospace,Consolas,monospace;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:text}
   /* 悬停胶囊：名字和“并发”用同一块底色、同一个圆角、同样 3px 的同色描边，看着是同一枚药丸 */
   .name,.load{border-radius:5px;transition:background .12s,box-shadow .12s}
   .name:hover,.load:hover{background:var(--chip);box-shadow:0 0 0 3px var(--chip)}
@@ -90,7 +97,7 @@ const PAGE = String.raw`<!doctype html>
     cursor:copy;border-radius:3px;transition:color .12s,background .12s}
   .mask:hover{color:var(--ink);background:var(--chip)}
   .mask.copied{color:var(--ok)}
-  .rename,.maxedit{font:inherit;font-size:13px;border:1px solid var(--line);border-radius:6px;
+  .rename,.maxedit{font-family:ui-monospace,Consolas,monospace;font-size:13px;border:1px solid var(--line);border-radius:6px;
     padding:1px 6px;background:var(--field);color:var(--ink);min-width:0;width:100%}
   .slidewrap{display:flex;align-items:center;gap:7px;justify-content:flex-end}
   .rwrap{display:flex;align-items:center;gap:4px}
@@ -220,6 +227,8 @@ const PAGE = String.raw`<!doctype html>
     border-top:1px solid var(--line)}
   form input{height:28px;border:1px solid var(--line);border-radius:7px;background:var(--field);color:var(--ink);padding:0 9px;
     font-size:12px;min-width:0;font-family:inherit}
+  /* 并发是个数字：和列表里的 5/10 用同一套等宽字形 */
+  form input[type=number]{font-family:ui-monospace,Consolas,monospace;font-size:12.5px}
   form input:focus{outline:none;border-color:var(--field-focus);box-shadow:0 0 0 3px var(--field-ring)}
   /* 数字输入框不要浏览器自带的上下箭头：格子太窄，箭头会挤掉数字 */
   form input[type=number]{-moz-appearance:textfield;appearance:textfield}
@@ -477,14 +486,24 @@ const fmt = (n) => !n ? "0" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ?
 const money = (c) => !c ? "$0" : c >= 0.01 ? "$" + c.toFixed(2) : c >= 0.001 ? "$" + c.toFixed(3) : "$" + c.toFixed(5);
 const mmss = (s) => Math.floor(Math.max(0, s) / 60) + ":" + String(Math.max(0, Math.round(s)) % 60).padStart(2, "0");
 
+/* 额度数据多久算新鲜：代理每 3 分钟刷一次，超过 6 分钟就是刷不动了（多半是断网） */
+const STALE_MS = 6 * 60 * 1000;
+/* 三档窗口里有数据、且数据不旧，才敢说“这把能用”。否则只是“暂时没看到毛病” */
+function dataOf(k) {
+  const at = k.quota && k.quota.at ? Number(k.quota.at) : 0;
+  const hasData = !!(k.breakdown && k.breakdown.hasData);
+  return { known: hasData && at > 0 && Date.now() - at <= STALE_MS };
+}
+
 // 一眼看圆点就知道能不能用。优先级和并发条完全一致，不能再各说各的：
-// 额度用完（红）> 试行（空心橙环）> 冷却（橙）> 鉴权坏（红）> 正常（绿）
-function stateOf(k, blocked) {
+// 额度用完（红）> 试行（空心橙环）> 冷却（橙）> 鉴权坏（红）> 没数据（灰）> 正常（绿）
+function stateOf(k, blocked, known = true) {
   if (k.enabled === false) return "off";
   if (blocked) return "full";
   if (k.probe) return "probe";
   if (k.cooldownSeconds > 0) return "cool";
   if (k.lastStatus === 401 || k.lastStatus === 403) return "bad";
+  if (!known) return "unknown";
   return "ok";
 }
 
@@ -552,9 +571,10 @@ function blankRow() {
 function updateRow(r, k) {
   const bd = k.breakdown || {};
   const blocked = k.enabled !== false && bd.R != null && bd.R <= 0;
-  const st = stateOf(k, blocked);
+  const data = dataOf(k);
+  const st = stateOf(k, blocked, data.known);
   const name = String(k.name);
-  r.el.className = "row" + (st === "off" ? " off" : "");
+  r.el.className = "row" + (st === "off" ? " off" : "") + (data.known ? "" : " stale");
   r.el.dataset.name = safeEnc(name);
   r.dot.className = "dot " + st;
 
@@ -634,7 +654,8 @@ function updateRow(r, k) {
   r.hit.title = hit == null ? "" : "缓存命中 " + hit + "%（今日 " + fmt(u.cacheRead) + " / " + fmt(u.promptTotal) + "）";
   r.cost.textContent = money(u.cost);
 
-  const sc = bd.total;
+  // 没拿到额度数据就不报一个假的 0.0：0 在这是“最便宜”，会被读成“最优先”
+  const sc = data.known ? bd.total : null;
   const lvl = sc == null ? "none" : sc <= 5 ? "low" : sc <= 20 ? "mid" : "high";
   const txt = sc == null || !Number.isFinite(sc) ? "—" : sc.toFixed(1);
   r.score.className = "score " + lvl;
@@ -647,6 +668,7 @@ function updateRow(r, k) {
     R: bd.R,
     st: [k.ok, k.rateLimited, k.authErrors],
     u: [u.input, u.output, u.cost],
+    known: data.known,
   }));
 
   const off = k.enabled === false;
@@ -656,7 +678,13 @@ function updateRow(r, k) {
 }
 
 function render(state) {
-  $("#dot").className = "dot ok";
+  // 顶上这盏灯说的是“额度数据还新不新”，不是“本机接口还活着”：断网时本机照样应答
+  const enabled = state.keys.filter((k) => k.enabled !== false);
+  const newest = enabled.reduce((t, k) => Math.max(t, (k.quota && k.quota.at) || 0), 0);
+  const ageMs = newest ? Date.now() - newest : Infinity;
+  const fresh = enabled.length > 0 && ageMs <= STALE_MS;
+  const dot = $("#dot");
+  dot.className = "dot " + (fresh ? "ok" : "off");
   $("#stamp").textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
 
   const list = $("#list");
@@ -672,12 +700,14 @@ function render(state) {
   }
   list.querySelectorAll(".skel,.empty").forEach((n) => n.remove());
 
+  const knownOf = new Map(state.keys.map((k) => [k.name, dataOf(k).known]));
   const keys = state.keys.slice().sort((a, b) => {
     const ua = usableOf(a) ? 0 : 1;
     const ub = usableOf(b) ? 0 : 1;
     if (ua !== ub) return ua - ub;
-    const ta = a.score == null ? Infinity : a.score;
-    const tb = b.score == null ? Infinity : b.score;
+    // 没数据的排到有数据的后面：看不见代价的不是“最便宜”，是不能比
+    const ta = knownOf.get(a.name) && a.score != null ? a.score : Infinity;
+    const tb = knownOf.get(b.name) && b.score != null ? b.score : Infinity;
     if (Math.abs(ta - tb) > 0.3) return ta - tb;
     const fa = a.fails || 0;
     const fb = b.fails || 0;
@@ -989,7 +1019,7 @@ function panHtml(p) {
     row("失败", '<b class="u">' + p.fail[0] + "</b>", null, null, wt(p.fail[1]), sign1(p.fail[2]));
 
   const foot = '<div class="s"><span>↑' + fmt(p.u[0]) + " ↓" + fmt(p.u[1]) + " " + money(p.u[2]) +
-    "</span><b>" + sign1(p.total) + "</b></div>";
+    "</span><b>" + (p.known === false ? "—" : sign1(p.total)) + "</b></div>";
   return rows + tail + foot;
 }
 
